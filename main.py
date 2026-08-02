@@ -22,7 +22,7 @@ import db
 # КОНФИГУРАЦИЯ
 # ─────────────────────────────────────────────
 
-BOT_TOKEN = "8878511511:AAEEqOkNBvwFrtTGpg17qBUFn2jlGthZAoE"
+BOT_TOKEN = "8855205894:AAEx3BIVUW4S3Ke3Bw6kGp8O07N_kYhyKBU"
 ADMIN_IDS = [6235378997, 111111111]  # ID всех, кто принимает решения по заявкам (узнать у @userinfobot)
 
 DEADLINE_DAYS = 10  # стандартный срок изготовления, рабочих дней
