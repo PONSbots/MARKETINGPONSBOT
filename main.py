@@ -1,10 +1,14 @@
 # bot.py — Бот для сбора заявок на макеты (v5)
 
+# bot.py — Бот для сбора заявок на макеты (v6)
+
 import logging
+import os
 import re
 from datetime import datetime, timedelta
 from typing import Optional
 
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
@@ -22,8 +26,23 @@ import db
 # КОНФИГУРАЦИЯ
 # ─────────────────────────────────────────────
 
-BOT_TOKEN = "8855205894:AAEx3BIVUW4S3Ke3Bw6kGp8O07N_kYhyKBU"
-ADMIN_IDS = [339202761, 6595169429, 104062161]  # ID всех, кто принимает решения по заявкам (1алексей, 2менеджер, 3татьяна)
+load_dotenv()  # подхватывает .env локально; в Railway переменные придут из Variables напрямую
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+# Отдел маркетинга — принимает/отклоняет заявку, делает и отправляет макет
+ADMIN_IDS = [6235378997, 111111111]
+
+# Отдел поддержки — первым делом проверяет, реально ли оплачен роялти
+SUPPORT_IDS = [222222222]
+
+# Директор — получает только информационные уведомления, без кнопок управления
+DIRECTOR_IDS = [333333333]
+
+# Куда падает обратная связь по самому боту (баги/пожелания) — обычно один человек
+FEEDBACK_ID = 6235378997
+
+STAFF_IDS = list(set(ADMIN_IDS) | set(SUPPORT_IDS) | set(DIRECTOR_IDS))
 
 DEADLINE_DAYS = 10  # стандартный срок изготовления, рабочих дней
 
@@ -38,7 +57,8 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 
 STATUS_LABELS = {
-    "pending": "🕐 На рассмотрении",
+    "pending_support": "🔎 Проверка роялти",
+    "pending": "🕐 На рассмотрении маркетингом",
     "in_progress": "✅ Принято в работу",
     "rejected": "❌ Отклонено",
     "completed": "🏁 Выполнено",
@@ -49,6 +69,7 @@ STATUS_LABELS = {
 # ─────────────────────────────────────────────
 
 (
+    ROYALTY_CHECK,     # 0. Оплачен ли роялти (да/нет) — до начала нумерованных шагов
     COMPANY_NAME,      # 1. Название юр.лица
     OBJECT_NAME,       # 2. Название объекта, город, адрес
     WORK_FORMAT,       # 3. Формат работ (баннер, наклейка, логотип, сайт и т.д.)
@@ -56,9 +77,9 @@ STATUS_LABELS = {
     TECH_TASK,         # 5. Полное ТЗ — что должно быть на макете
     SIZE,              # 6. Размер
     DEADLINE_CONFIRM,  # 7. Согласие со сроком изготовления (10 раб.дней)
-) = range(7)
+) = range(8)
 
-TOTAL_STEPS = 7
+TOTAL_STEPS = 7  # нумерация "Шаг N из 7" не считает вопрос про роялти
 
 # ─────────────────────────────────────────────
 # КЛАВИАТУРЫ
@@ -68,6 +89,7 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📝 Подать заявку")],
         [KeyboardButton("📋 Мои заявки")],
+        [KeyboardButton("💬 Обратная связь")],
     ],
     resize_keyboard=True,
 )
@@ -106,11 +128,66 @@ def generate_request_id() -> str:
     """Генерирует ID заявки"""
     return f"REQ-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-def is_admin(user_id: int) -> bool:
+def is_marketing(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+def is_support(user_id: int) -> bool:
+    return user_id in SUPPORT_IDS
+
+def is_director(user_id: int) -> bool:
+    return user_id in DIRECTOR_IDS
+
+def build_director_new_request_text(req) -> str:
+    """Короткое информационное уведомление директору о новой заявке"""
+    return (
+        f"🆕 <b>Новая заявка #{req['request_id']}</b>\n"
+        f"🏢 Юр.лицо: {req['company']}\n"
+        f"📍 Адрес: {req['object']}\n"
+        f"🎨 Что хотят: {req['work_format']}"
+    )
+
+def build_director_completed_text(req) -> str:
+    """Короткое информационное уведомление директору о закрытой заявке"""
+    return (
+        f"✅ <b>Заявка #{req['request_id']} закрыта</b>\n"
+        f"🏢 Юр.лицо: {req['company']}\n"
+        f"📍 Адрес: {req['object']}"
+    )
+
+async def notify_directors_new_request(context: ContextTypes.DEFAULT_TYPE, request_id: str) -> None:
+    req = db.get_request(request_id)
+    text = build_director_new_request_text(req)
+    for director_id in DIRECTOR_IDS:
+        try:
+            await context.bot.send_message(chat_id=director_id, text=text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Не удалось уведомить директора {director_id}: {e}")
+
+async def notify_directors_completed(context: ContextTypes.DEFAULT_TYPE, request_id: str) -> None:
+    req = db.get_request(request_id)
+    text = build_director_completed_text(req)
+    for director_id in DIRECTOR_IDS:
+        try:
+            await context.bot.send_message(chat_id=director_id, text=text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Не удалось уведомить директора {director_id}: {e}")
+
+def build_support_card_text(req) -> str:
+    """Минимальная карточка для поддержки — только то, что нужно для проверки роялти"""
+    lines = [
+        f"🆕 <b>ЗАЯВКА #{req['request_id']}</b> — проверка роялти",
+        "━" * 30,
+        f"🆔 <b>ID заказчика:</b> <code>{req['user_id']}</code>",
+        f"🏢 <b>Юр.лицо:</b> {req['company']}",
+        f"📍 <b>Объект:</b> {req['object']}",
+        f"💳 <b>Роялти оплачен (со слов партнёра):</b> {req['royalty_answer']}",
+        "━" * 30,
+        f"Статус: {STATUS_LABELS.get(req['status'], req['status'])}",
+    ]
+    return "\n".join(lines)
+
 def build_admin_card_text(req) -> str:
-    """Единый текст карточки заявки для админов — используется и при рассылке
+    """Единый текст карточки заявки для маркетинга — используется и при рассылке
     новой заявки, и при показе карточки из списка «В работе»"""
     task_date = datetime.fromisoformat(req["task_date"])
     lines = [
@@ -133,8 +210,7 @@ def build_admin_card_text(req) -> str:
     return "\n".join(lines)
 
 def in_progress_action_keyboard(request_id: str) -> InlineKeyboardMarkup:
-    """Кнопки действий для заявки, которая уже в работе (используется и в
-    уведомлении, и в карточке из списка «В работе»)"""
+    """Кнопки действий для заявки, которая уже в работе у маркетинга"""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🏁 Выполнено", callback_data=f"complete_{request_id}"),
@@ -144,7 +220,8 @@ def in_progress_action_keyboard(request_id: str) -> InlineKeyboardMarkup:
 
 async def update_all_admin_messages(context: ContextTypes.DEFAULT_TYPE, request_id: str, text: str,
                                      reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
-    """Обновляет карточку заявки во всех чатах админов, куда она была разослана"""
+    """Обновляет карточку заявки во всех чатах сотрудников, куда она была разослана
+    (и поддержка, и маркетинг хранятся в одной таблице)"""
     for row in db.get_admin_messages(request_id):
         try:
             await context.bot.edit_message_text(
@@ -155,7 +232,7 @@ async def update_all_admin_messages(context: ContextTypes.DEFAULT_TYPE, request_
                 reply_markup=reply_markup,
             )
         except Exception as e:
-            logger.error(f"Не удалось обновить сообщение админа {row['chat_id']}: {e}")
+            logger.error(f"Не удалось обновить сообщение сотрудника {row['chat_id']}: {e}")
 
 # ─────────────────────────────────────────────
 # КОМАНДЫ
@@ -167,7 +244,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     await update.message.reply_text(
         f"👋 Привет, {user.first_name}!\n\n"
-        "Это бот компании PON-PUSHKA для заказа макетов — баннеров, вывесок, диджитал-рекламы и другой печатной/цифровой продукции для ваших объектов.Больше не нужно писать в чат и ждать ответа менеджера — заявка подаётся прямо в отдел маркетинга за пару минут, а статус всегда видно в самом боте.",
+        "Я бот для подачи заявок в отдел маркетинга компании PON-PUSHKA.",
         reply_markup=MAIN_MENU_KEYBOARD,
     )
 
@@ -177,13 +254,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def start_new_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Запускает диалог сбора новой заявки (вызывается из /start и из кнопки меню)"""
     context.user_data.clear()  # чистим данные предыдущей заявки
-    await prompt_company(update.effective_chat.id, context)
-    return COMPANY_NAME
+    await prompt_royalty(update.effective_chat.id, context)
+    return ROYALTY_CHECK
 
 
 # ─────────────────────────────────────────────
 # ФУНКЦИИ ОТПРАВКИ ШАГОВ (переиспользуются и вперёд, и назад)
 # ─────────────────────────────────────────────
+
+async def prompt_royalty(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [
+        [InlineKeyboardButton("✅ Да", callback_data="royalty_yes")],
+        [InlineKeyboardButton("❌ Нет", callback_data="royalty_no")],
+    ]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Прежде чем начать — <b>оплачен ли у вас роялти?</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    # Постоянная клавиатура с "Назад" тоже показывается с самого первого шага
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Выберите вариант выше 👆",
+        reply_markup=BACK_KEYBOARD,
+    )
+
 
 async def prompt_company(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_message(
@@ -216,7 +312,7 @@ async def prompt_work_format(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -
         text=(
             f"📝 <b>Шаг 3 из {TOTAL_STEPS}</b>\n"
             "Какой <b>формат работ</b> тебе нужен?\n"
-            "<i>Например: баннер, наклейка, логотип, обновление тв, и т.д....</i>"
+            "<i>Например: баннер, наклейка, логотип, обновление сайта...</i>"
         ),
         parse_mode="HTML",
         reply_markup=BACK_KEYBOARD,
@@ -325,14 +421,43 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # ШАГИ ДИАЛОГА
 # ─────────────────────────────────────────────
 
-async def get_company_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Получаем название юр.лица"""
-    if update.message.text == BACK_TEXT:
-        await update.message.reply_text(
-            "Хорошо, отменил подачу заявки.",
+async def handle_royalty_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает ответ на вопрос об оплате роялти"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "royalty_no":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "К сожалению, без оплаты роялти мы не можем принять заявку в работу.\n"
+                "Оплатите роялти и подайте заявку заново."
+            ),
             reply_markup=MAIN_MENU_KEYBOARD,
         )
         return ConversationHandler.END
+
+    context.user_data["royalty_answer"] = "Да"
+    await query.edit_message_text("✅ Роялти оплачен")
+    await prompt_company(update.effective_chat.id, context)
+    return COMPANY_NAME
+
+
+async def back_from_royalty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Нажата reply-кнопка 'Назад' на самом первом вопросе — отменяем заявку целиком"""
+    await update.message.reply_text(
+        "Хорошо, отменил подачу заявки.",
+        reply_markup=MAIN_MENU_KEYBOARD,
+    )
+    return ConversationHandler.END
+
+
+async def get_company_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получаем название юр.лица"""
+    if update.message.text == BACK_TEXT:
+        await prompt_royalty(update.effective_chat.id, context)
+        return ROYALTY_CHECK
 
     context.user_data["company"] = update.message.text.strip()
     await prompt_object(update.effective_chat.id, context)
@@ -415,7 +540,7 @@ async def get_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def confirm_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Финальный шаг — согласие со сроком → отправка заявки"""
+    """Финальный шаг — согласие со сроком → отправка заявки в поддержку на проверку роялти"""
     query = update.callback_query
     await query.answer()
 
@@ -441,14 +566,14 @@ async def confirm_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"📐 <b>Размер:</b> {context.user_data['size']}\n"
         f"⏰ <b>Дедлайн:</b> {deadline_str}\n"
         f"{'━' * 30}\n"
-        f"✅ Заявка отправлена на рассмотрение!\n"
+        f"✅ Заявка отправлена на проверку!\n"
         f"Ожидай уведомления о статусе.\n\n"
         f"Статус всегда можно посмотреть в «📋 Мои заявки»."
     )
 
     await query.edit_message_text(summary, parse_mode="HTML")
 
-    # Сохраняем заявку в SQLite
+    # Сохраняем заявку в SQLite (статус всегда стартует с 'pending_support')
     db.create_request(
         request_id=request_id,
         user_id=update.effective_user.id,
@@ -460,10 +585,14 @@ async def confirm_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         print_type=context.user_data["print_type"],
         size=context.user_data["size"],
         deadline_str=deadline_str,
+        royalty_answer=context.user_data["royalty_answer"],
     )
 
-    # ── ОТПРАВЛЯЕМ ЗАЯВКУ ВСЕМ АДМИНАМ ──
-    await send_to_admins(context, request_id)
+    # ── ОТПРАВЛЯЕМ ЗАЯВКУ В ПОДДЕРЖКУ НА ПРОВЕРКУ РОЯЛТИ ──
+    await send_to_support(context, request_id)
+
+    # ── Информационное уведомление директору (без кнопок) ──
+    await notify_directors_new_request(context, request_id)
 
     # Показываем меню заказчику снова — теперь, когда заявка реально подана
     await context.bot.send_message(
@@ -481,8 +610,31 @@ async def back_from_deadline_confirm(update: Update, context: ContextTypes.DEFAU
     return SIZE
 
 
-async def send_to_admins(context: ContextTypes.DEFAULT_TYPE, request_id: str) -> None:
-    """Рассылает новую заявку ВСЕМ админам из ADMIN_IDS с кнопками управления"""
+async def send_to_support(context: ContextTypes.DEFAULT_TYPE, request_id: str) -> None:
+    """Рассылает новую заявку ВСЕМ сотрудникам поддержки — на проверку роялти"""
+    req = db.get_request(request_id)
+    text = build_support_card_text(req)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подтверждаю оплату", callback_data=f"confirm_royalty_{request_id}")],
+        [InlineKeyboardButton("❌ Роялти не оплачен", callback_data=f"reject_royalty_{request_id}")],
+    ])
+
+    for support_id in SUPPORT_IDS:
+        try:
+            msg = await context.bot.send_message(
+                chat_id=support_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            db.add_admin_message(request_id, msg.chat_id, msg.message_id)
+        except Exception as e:
+            logger.error(f"Не удалось отправить заявку в поддержку {support_id}: {e}")
+
+
+async def send_to_marketing(context: ContextTypes.DEFAULT_TYPE, request_id: str) -> None:
+    """Рассылает заявку ВСЕМ сотрудникам маркетинга (вызывается после подтверждения роялти)"""
     req = db.get_request(request_id)
     text = build_admin_card_text(req)
 
@@ -501,15 +653,127 @@ async def send_to_admins(context: ContextTypes.DEFAULT_TYPE, request_id: str) ->
             )
             db.add_admin_message(request_id, msg.chat_id, msg.message_id)
         except Exception as e:
-            logger.error(f"Не удалось отправить заявку админу {admin_id}: {e}")
+            logger.error(f"Не удалось отправить заявку в маркетинг {admin_id}: {e}")
 
 
 # ─────────────────────────────────────────────
-# ОБРАБОТЧИКИ КНОПОК АДМИНА
+# ПРОВЕРКА РОЯЛТИ (ОТДЕЛ ПОДДЕРЖКИ)
+# ─────────────────────────────────────────────
+
+async def confirm_royalty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Поддержка подтвердила оплату роялти → заявка уходит в маркетинг"""
+    query = update.callback_query
+    await query.answer()
+
+    request_id = query.data.replace("confirm_royalty_", "")
+    req = db.get_request(request_id)
+    if not req:
+        await query.edit_message_text("⚠️ Заявка не найдена.")
+        return
+
+    if req["status"] != "pending_support":
+        await query.answer("Эту заявку уже обработал(а) другой сотрудник.", show_alert=True)
+        return
+
+    db.set_status(request_id, "pending")
+    req = db.get_request(request_id)
+
+    await update_all_admin_messages(context, request_id, build_support_card_text(req))
+    await send_to_marketing(context, request_id)
+
+
+async def reject_royalty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Поддержка не подтвердила оплату роялти → заявка отклоняется, в маркетинг не уходит"""
+    query = update.callback_query
+    await query.answer()
+
+    request_id = query.data.replace("reject_royalty_", "")
+    req = db.get_request(request_id)
+    if not req:
+        await query.edit_message_text("⚠️ Заявка не найдена.")
+        return
+
+    if req["status"] != "pending_support":
+        await query.answer("Эту заявку уже обработал(а) другой сотрудник.", show_alert=True)
+        return
+
+    reason = "Роялти не оплачен"
+    db.set_status(request_id, "rejected", reason=reason)
+    req = db.get_request(request_id)
+
+    await update_all_admin_messages(context, request_id, build_support_card_text(req))
+
+    try:
+        await context.bot.send_message(
+            chat_id=req["user_id"],
+            text=(
+                f"❌ Твоя заявка <b>#{request_id}</b> отклонена.\n\n"
+                f"К сожалению, роялти не оплачен, поэтому маркетинг не может взять заявку в работу.\n"
+                f"Оплатите роялти и подайте заявку заново через «📝 Подать заявку»."
+            ),
+            parse_mode="HTML",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+    except Exception as e:
+        logger.error(f"Не удалось уведомить заказчика {req['user_id']}: {e}")
+
+
+async def show_pending_royalty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Список заявок, ожидающих проверки роялти (для поддержки)"""
+    if not is_support(update.effective_user.id):
+        return
+
+    requests = db.get_requests_by_status("pending_support")
+
+    if not requests:
+        await update.message.reply_text("Сейчас нет заявок на проверку роялти.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(f"#{r['request_id']} — {r['company']}", callback_data=f"view_royalty_{r['request_id']}")]
+        for r in requests
+    ]
+
+    await update.message.reply_text(
+        "🔎 <b>Заявки на проверку роялти:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def view_royalty_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Открывает карточку заявки на проверку роялти из списка"""
+    query = update.callback_query
+    await query.answer()
+
+    request_id = query.data.replace("view_royalty_", "")
+    req = db.get_request(request_id)
+    if not req:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Заявка не найдена.")
+        return
+
+    text = build_support_card_text(req)
+
+    if req["status"] == "pending_support":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Подтверждаю оплату", callback_data=f"confirm_royalty_{request_id}")],
+            [InlineKeyboardButton("❌ Роялти не оплачен", callback_data=f"reject_royalty_{request_id}")],
+        ])
+    else:
+        keyboard = None
+
+    msg = await context.bot.send_message(
+        chat_id=update.effective_chat.id, text=text, parse_mode="HTML", reply_markup=keyboard,
+    )
+    db.add_admin_message(request_id, msg.chat_id, msg.message_id)
+
+
+# ─────────────────────────────────────────────
+# ОБРАБОТЧИКИ КНОПОК МАРКЕТИНГА
 # ─────────────────────────────────────────────
 
 async def admin_accept(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кто-то из админов нажал 'Принято в работу'"""
+    """Кто-то из маркетинга нажал 'Принято в работу'"""
     query = update.callback_query
     await query.answer()
 
@@ -526,7 +790,7 @@ async def admin_accept(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     db.set_status(request_id, "in_progress")
     req = db.get_request(request_id)  # перечитываем со свежим статусом
 
-    # Обновляем карточку у ВСЕХ админов сразу (чтобы не получилось, что двое
+    # Обновляем карточку у ВСЕХ сотрудников сразу (чтобы не получилось, что двое
     # одновременно жмут разные кнопки на одной и той же заявке)
     await update_all_admin_messages(
         context, request_id, build_admin_card_text(req), in_progress_action_keyboard(request_id)
@@ -548,7 +812,7 @@ async def admin_accept(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Админ нажал 'Выполнено' — запрашиваем макет"""
+    """Маркетинг нажал 'Выполнено' — запрашиваем макет"""
     query = update.callback_query
     await query.answer()
 
@@ -558,7 +822,7 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text("⚠️ Заявка не найдена.")
         return
 
-    # Помечаем, что от этого админа ждём файл макета для этой заявки
+    # Помечаем, что от этого сотрудника ждём файл макета для этой заявки
     context.bot_data.setdefault("awaiting_layout_file", {})[update.effective_user.id] = request_id
 
     await context.bot.send_message(
@@ -573,13 +837,13 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def admin_receive_layout_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ловит файл/фото от админа, если он ожидается для конкретной заявки.
+    """Ловит файл/фото от сотрудника маркетинга, если он ожидается для конкретной заявки.
     Файл пока НЕ уходит заказчику — сначала просим подтверждение."""
     admin_id = update.effective_user.id
     awaiting = context.bot_data.get("awaiting_layout_file", {})
     request_id = awaiting.get(admin_id)
     if not request_id:
-        return  # админ просто прислал что-то не по делу — игнорируем
+        return  # прислал что-то не по делу — игнорируем
 
     req = db.get_request(request_id)
     if not req:
@@ -625,7 +889,7 @@ async def admin_receive_layout_file(update: Update, context: ContextTypes.DEFAUL
 
 
 async def confirm_send_layout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Админ подтвердил отправку макета — теперь реально отправляем заказчику"""
+    """Маркетинг подтвердил отправку макета — теперь реально отправляем заказчику"""
     query = update.callback_query
     admin_id = update.effective_user.id
 
@@ -667,7 +931,7 @@ async def confirm_send_layout(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cancel_send_layout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Админ передумал — файл никуда не уходит, можно прислать другой"""
+    """Сотрудник передумал — файл никуда не уходит, можно прислать другой"""
     query = update.callback_query
     admin_id = update.effective_user.id
 
@@ -686,7 +950,7 @@ async def cancel_send_layout(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def admin_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Админ нажал 'Отклонено' — запрашиваем причину"""
+    """Маркетинг нажал 'Отклонено' — запрашиваем причину"""
     query = update.callback_query
     await query.answer()
 
@@ -696,7 +960,7 @@ async def admin_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.edit_message_text("⚠️ Заявка не найдена.")
         return
 
-    # Помечаем, что от этого админа ждём текст причины для этой заявки
+    # Помечаем, что от этого сотрудника ждём текст причины для этой заявки
     context.bot_data.setdefault("awaiting_reject_reason", {})[update.effective_user.id] = request_id
 
     await context.bot.send_message(
@@ -707,7 +971,7 @@ async def admin_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def admin_receive_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ловит текстовое сообщение от админа, если оно является причиной отклонения"""
+    """Ловит текстовое сообщение от сотрудника маркетинга, если оно является причиной отклонения"""
     admin_id = update.effective_user.id
     awaiting = context.bot_data.get("awaiting_reject_reason", {})
     request_id = awaiting.get(admin_id)
@@ -741,7 +1005,7 @@ async def admin_receive_reject_reason(update: Update, context: ContextTypes.DEFA
     except Exception as e:
         logger.error(f"Не удалось уведомить заказчика {req['user_id']}: {e}")
 
-    # Обновляем карточки у всех админов
+    # Обновляем карточки у всех сотрудников
     await update_all_admin_messages(context, request_id, build_admin_card_text(req))
 
 
@@ -752,12 +1016,12 @@ async def noop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────
-# СПИСОК "В РАБОТЕ" (для админов)
+# СПИСОК "В РАБОТЕ" (для маркетинга)
 # ─────────────────────────────────────────────
 
 async def show_in_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает список заявок в статусе in_progress инлайн-кнопками"""
-    if not is_admin(update.effective_user.id):
+    if not is_marketing(update.effective_user.id):
         return
 
     requests = db.get_requests_by_status("in_progress")
@@ -794,31 +1058,30 @@ async def view_request_card(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if req["status"] == "in_progress":
         reply_markup = in_progress_action_keyboard(request_id)
     else:
-        reply_markup = None  # заявка уже сменила статус, пока список не обновляли — просто показываем инфо
+        reply_markup = None
 
     msg = await context.bot.send_message(
         chat_id=update.effective_chat.id, text=text, parse_mode="HTML", reply_markup=reply_markup,
     )
 
-    # Регистрируем это сообщение тоже, чтобы оно обновлялось при смене статуса
     db.add_admin_message(request_id, msg.chat_id, msg.message_id)
 
 
 # ─────────────────────────────────────────────
-# ОБЩИЙ РОУТЕР ТЕКСТОВЫХ СООБЩЕНИЙ / ФАЙЛОВ ОТ АДМИНОВ
+# ОБЩИЙ РОУТЕР ТЕКСТОВЫХ СООБЩЕНИЙ / ФАЙЛОВ ОТ СОТРУДНИКОВ
 # (вне ConversationHandler — реагирует на причину отклонения и файл макета)
 # ─────────────────────────────────────────────
 
 async def admin_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Единая точка входа для текстовых сообщений от админа вне диалога заявки"""
-    if not is_admin(update.effective_user.id):
+    """Единая точка входа для текстовых сообщений от маркетинга вне диалога заявки"""
+    if not is_marketing(update.effective_user.id):
         return
     await admin_receive_reject_reason(update, context)
 
 
 async def admin_file_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Единая точка входа для файлов/фото от админа"""
-    if not is_admin(update.effective_user.id):
+    """Единая точка входа для файлов/фото от маркетинга"""
+    if not is_marketing(update.effective_user.id):
         return
     await admin_receive_layout_file(update, context)
 
@@ -840,8 +1103,9 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ─────────────────────────────────────────────
 
 def main() -> None:
-    if not BOT_TOKEN or BOT_TOKEN == "ВСТАВЬ_ТОКЕН_ОТ_BOTFATHER":
-        print("❌ Вставь токен в BOT_TOKEN!")
+    if not BOT_TOKEN:
+        print("❌ Не найден BOT_TOKEN. Задай переменную окружения BOT_TOKEN (в .env локально "
+              "или в Variables на Railway) и перезапусти.")
         return
 
     db.init_db()
@@ -849,13 +1113,17 @@ def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Диалог сбора заявки. Точки входа: /start и кнопка "Подать заявку".
-    # Админам эта ветка не нужна — исключаем их явно.
+    # Сотрудникам (и маркетингу, и поддержке) эта ветка не нужна — исключаем их явно.
     conv_handler = ConversationHandler(
         entry_points=[
-            CommandHandler("start", start, filters=~filters.User(user_id=ADMIN_IDS)),
-            MessageHandler(filters.Regex("^📝 Подать заявку$") & ~filters.User(user_id=ADMIN_IDS), start_new_request),
+            CommandHandler("start", start, filters=~filters.User(user_id=STAFF_IDS)),
+            MessageHandler(filters.Regex("^📝 Подать заявку$") & ~filters.User(user_id=STAFF_IDS), start_new_request),
         ],
         states={
+            ROYALTY_CHECK: [
+                CallbackQueryHandler(handle_royalty_answer, pattern="^royalty_(yes|no)$"),
+                MessageHandler(filters.Regex(f"^{re.escape(BACK_TEXT)}$"), back_from_royalty),
+            ],
             COMPANY_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_company_name)],
             OBJECT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_object_name)],
             WORK_FORMAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_work_format)],
@@ -875,28 +1143,37 @@ def main() -> None:
 
     application.add_handler(conv_handler)
 
-    # Кнопка "Мои заявки" (не-админ)
+    # Кнопка "Мои заявки" (не сотрудник)
     application.add_handler(
         MessageHandler(
-            filters.Regex("^📋 Мои заявки$") & ~filters.User(user_id=ADMIN_IDS),
+            filters.Regex("^📋 Мои заявки$") & ~filters.User(user_id=STAFF_IDS),
             show_my_requests,
         )
     )
 
-    # /start и команда для админов — список "В работе"
+    # /start для маркетинга — сразу список "В работе"
     application.add_handler(CommandHandler("start", lambda u, c: show_in_progress(u, c), filters=filters.User(user_id=ADMIN_IDS)))
     application.add_handler(CommandHandler("inprogress", show_in_progress, filters=filters.User(user_id=ADMIN_IDS)))
-    application.add_handler(CallbackQueryHandler(view_request_card, pattern="^view_"))
+    application.add_handler(CallbackQueryHandler(view_request_card, pattern="^view_(?!royalty_)"))
 
-    # Кнопки админа
+    # /start для поддержки — список заявок на проверку роялти
+    application.add_handler(CommandHandler("start", lambda u, c: show_pending_royalty(u, c), filters=filters.User(user_id=SUPPORT_IDS)))
+    application.add_handler(CommandHandler("pendingroyalty", show_pending_royalty, filters=filters.User(user_id=SUPPORT_IDS)))
+    application.add_handler(CallbackQueryHandler(view_royalty_card, pattern="^view_royalty_"))
+
+    # Кнопки поддержки (проверка роялти)
+    application.add_handler(CallbackQueryHandler(confirm_royalty, pattern="^confirm_royalty_"))
+    application.add_handler(CallbackQueryHandler(reject_royalty, pattern="^reject_royalty_"))
+
+    # Кнопки маркетинга
     application.add_handler(CallbackQueryHandler(admin_accept, pattern="^accept_"))
     application.add_handler(CallbackQueryHandler(admin_complete, pattern="^complete_"))
-    application.add_handler(CallbackQueryHandler(admin_reject, pattern="^reject_"))
+    application.add_handler(CallbackQueryHandler(admin_reject, pattern="^reject_(?!royalty_)"))
     application.add_handler(CallbackQueryHandler(confirm_send_layout, pattern="^send_layout_"))
     application.add_handler(CallbackQueryHandler(cancel_send_layout, pattern="^cancel_layout_"))
     application.add_handler(CallbackQueryHandler(noop, pattern="^noop$"))
 
-    # Текст/файлы от админа вне диалога заявки (причина отклонения / файл макета)
+    # Текст/файлы от маркетинга вне диалога заявки (причина отклонения / файл макета)
     application.add_handler(
         MessageHandler(filters.User(user_id=ADMIN_IDS) & filters.TEXT & ~filters.COMMAND, admin_text_router)
     )
