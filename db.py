@@ -27,7 +27,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS requests (
                 request_id      TEXT PRIMARY KEY,
                 user_id         INTEGER NOT NULL,
-                status          TEXT NOT NULL DEFAULT 'pending',
+                status          TEXT NOT NULL DEFAULT 'pending_support',
                 reason          TEXT,
                 company         TEXT,
                 object          TEXT,
@@ -38,20 +38,23 @@ def init_db() -> None:
                 size            TEXT,
                 deadline_str    TEXT,
                 is_urgent       INTEGER,
+                royalty_answer  TEXT,
                 admin_chat_id   INTEGER,
                 admin_message_id INTEGER,
                 created_at      TEXT
             )
             """
         )
-        # Миграция для БД, созданных до появления поля work_format
+        # Миграции для БД, созданных до появления этих полей
         existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(requests)")}
         if "work_format" not in existing_columns:
             conn.execute("ALTER TABLE requests ADD COLUMN work_format TEXT")
+        if "royalty_answer" not in existing_columns:
+            conn.execute("ALTER TABLE requests ADD COLUMN royalty_answer TEXT")
 
-        # Заявка теперь может быть отправлена НЕСКОЛЬКИМ админам одновременно —
-        # тут храним по одной строке на каждое такое сообщение, чтобы потом
-        # можно было обновить/отредактировать все разом.
+        # Заявка может быть отправлена НЕСКОЛЬКИМ сотрудникам одновременно (и в
+        # поддержку, и в маркетинг) — тут храним по одной строке на каждое такое
+        # сообщение, чтобы потом можно было обновить/отредактировать все разом.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS admin_messages (
@@ -75,15 +78,19 @@ def create_request(
     print_type: str,
     size: str,
     deadline_str: str,
+    royalty_answer: str,
 ) -> None:
+    """Создаёт заявку. Изначальный статус всегда 'pending_support' —
+    сначала её должна подтвердить поддержка (проверка роялти), и только
+    после этого она попадёт к маркетингу."""
     with get_conn() as conn:
         conn.execute(
             """
             INSERT INTO requests (
                 request_id, user_id, status, reason,
                 company, object, task_date, work_format, tech_task, print_type, size,
-                deadline_str, is_urgent, admin_chat_id, admin_message_id, created_at
-            ) VALUES (?, ?, 'pending', NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?)
+                deadline_str, is_urgent, royalty_answer, admin_chat_id, admin_message_id, created_at
+            ) VALUES (?, ?, 'pending_support', NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?)
             """,
             (
                 request_id,
@@ -96,6 +103,7 @@ def create_request(
                 print_type,
                 size,
                 deadline_str,
+                royalty_answer,
                 datetime.now().isoformat(),
             ),
         )
@@ -111,8 +119,8 @@ def set_admin_message(request_id: str, admin_chat_id: int, admin_message_id: int
 
 
 def add_admin_message(request_id: str, chat_id: int, message_id: int) -> None:
-    """Регистрирует ещё одно сообщение у конкретного админа для этой заявки
-    (используется, когда заявка/карточка разослана нескольким админам)."""
+    """Регистрирует ещё одно сообщение у конкретного сотрудника для этой заявки
+    (используется и для поддержки, и для маркетинга — таблица общая)."""
     with get_conn() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO admin_messages (request_id, chat_id, message_id) VALUES (?, ?, ?)",
@@ -121,7 +129,7 @@ def add_admin_message(request_id: str, chat_id: int, message_id: int) -> None:
 
 
 def get_admin_messages(request_id: str) -> list[sqlite3.Row]:
-    """Возвращает все сообщения у админов, связанные с этой заявкой"""
+    """Возвращает все сообщения сотрудников, связанные с этой заявкой"""
     with get_conn() as conn:
         cur = conn.execute(
             "SELECT chat_id, message_id FROM admin_messages WHERE request_id = ?",
