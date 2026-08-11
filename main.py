@@ -40,7 +40,7 @@ SUPPORT_IDS = [6595169429] #manager PON'S
 DIRECTOR_IDS = [333333333] #Алексей
 
 # Куда падает обратная связь по самому боту (баги/пожелания) — обычно один человек
-FEEDBACK_ID = 6235378997 #Кирилл
+FEEDBACK_ID = [6235378997] #Кирилл
 
 STAFF_IDS = list(set(ADMIN_IDS) | set(SUPPORT_IDS) | set(DIRECTOR_IDS))
 
