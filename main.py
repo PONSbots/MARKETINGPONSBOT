@@ -1,6 +1,4 @@
-# bot.py — Бот для сбора заявок на макеты (v5)
-
-# bot.py — Бот для сбора заявок на макеты (v6)
+# bot.py — Бот для сбора заявок на макеты (v7)
 
 import logging
 import os
@@ -31,16 +29,16 @@ load_dotenv()  # подхватывает .env локально; в Railway пе
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 # Отдел маркетинга — принимает/отклоняет заявку, делает и отправляет макет
-ADMIN_IDS = [104062161] #Татьяна
+ADMIN_IDS = [6235378997, 111111111]
 
 # Отдел поддержки — первым делом проверяет, реально ли оплачен роялти
-SUPPORT_IDS = [6595169429] #manager PON'S
+SUPPORT_IDS = [222222222]
 
 # Директор — получает только информационные уведомления, без кнопок управления
-DIRECTOR_IDS = [333333333] #Алексей
+DIRECTOR_IDS = [333333333]
 
 # Куда падает обратная связь по самому боту (баги/пожелания) — обычно один человек
-FEEDBACK_ID = [6235378997] #Кирилл
+FEEDBACK_ID = 6235378997
 
 STAFF_IDS = list(set(ADMIN_IDS) | set(SUPPORT_IDS) | set(DIRECTOR_IDS))
 
@@ -221,7 +219,7 @@ def in_progress_action_keyboard(request_id: str) -> InlineKeyboardMarkup:
 async def update_all_admin_messages(context: ContextTypes.DEFAULT_TYPE, request_id: str, text: str,
                                      reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     """Обновляет карточку заявки во всех чатах сотрудников, куда она была разослана
-    (и поддержка, и маркетинг хранятся в одной таблице)"""
+    (поддержка и маркетинг хранятся в одной таблице)"""
     for row in db.get_admin_messages(request_id):
         try:
             await context.bot.edit_message_text(
@@ -249,6 +247,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
 
     return await start_new_request(update, context)
+
+
+async def director_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start для директора — просто пояснение, без меню заявок"""
+    await update.message.reply_text(
+        "👋 Привет! Здесь будут появляться короткие уведомления о новых и закрытых заявках."
+    )
 
 
 async def start_new_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -415,6 +420,54 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=MAIN_MENU_KEYBOARD,
     )
     return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────
+# ОБРАТНАЯ СВЯЗЬ ПО БОТУ (уходит одному конкретному человеку — FEEDBACK_ID)
+# ─────────────────────────────────────────────
+
+async def feedback_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Нажата кнопка 'Обратная связь' — просим написать текст следующим сообщением"""
+    context.user_data["awaiting_feedback"] = True
+    await update.message.reply_text(
+        "Бот пока тестируется. Если у вас есть замечания, предложения и т.д. по боту, "
+        "отправьте их следующим сообщением:",
+        reply_markup=MAIN_MENU_KEYBOARD,
+    )
+
+
+async def customer_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ловит обычный текст от партнёров вне диалога заявки — сейчас нужен только
+    для пересылки обратной связи."""
+    if not context.user_data.get("awaiting_feedback"):
+        return  # не наш случай — просто игнорируем случайный текст
+
+    context.user_data["awaiting_feedback"] = False
+
+    user = update.effective_user
+    feedback_text = update.message.text.strip()
+
+    try:
+        await context.bot.send_message(
+            chat_id=FEEDBACK_ID,
+            text=(
+                f"💬 <b>Обратная связь по боту</b>\n"
+                f"От: {user.full_name} (@{user.username or 'нет username'})\n"
+                f"ID: <code>{user.id}</code>\n\n"
+                f"{feedback_text}"
+            ),
+            parse_mode="HTML",
+        )
+        await update.message.reply_text(
+            "Спасибо! Сообщение передано разработчику.",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+    except Exception as e:
+        logger.error(f"Не удалось переслать обратную связь: {e}")
+        await update.message.reply_text(
+            "⚠️ Не получилось отправить сообщение, попробуйте ещё раз позже.",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
 
 
 # ─────────────────────────────────────────────
@@ -923,6 +976,9 @@ async def confirm_send_layout(update: Update, context: ContextTypes.DEFAULT_TYPE
         req = db.get_request(request_id)
         await update_all_admin_messages(context, request_id, build_admin_card_text(req))
         await query.edit_message_caption(caption=f"✅ Макет по заявке #{request_id} отправлен заказчику.")
+
+        # ── Информационное уведомление директору о закрытии заявки ──
+        await notify_directors_completed(context, request_id)
     except Exception as e:
         logger.error(f"Не удалось отправить макет заказчику {req['user_id']}: {e}")
         await query.edit_message_caption(caption=f"⚠️ Не удалось отправить макет: {e}")
@@ -1068,7 +1124,7 @@ async def view_request_card(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # ─────────────────────────────────────────────
-# ОБЩИЙ РОУТЕР ТЕКСТОВЫХ СООБЩЕНИЙ / ФАЙЛОВ ОТ СОТРУДНИКОВ
+# ОБЩИЙ РОУТЕР ТЕКСТОВЫХ СООБЩЕНИЙ / ФАЙЛОВ ОТ СОТРУДНИКОВ МАРКЕТИНГА
 # (вне ConversationHandler — реагирует на причину отклонения и файл макета)
 # ─────────────────────────────────────────────
 
@@ -1113,7 +1169,7 @@ def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Диалог сбора заявки. Точки входа: /start и кнопка "Подать заявку".
-    # Сотрудникам (и маркетингу, и поддержке) эта ветка не нужна — исключаем их явно.
+    # Сотрудникам (маркетинг/поддержка/директор) эта ветка не нужна — исключаем их явно.
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start, filters=~filters.User(user_id=STAFF_IDS)),
@@ -1143,11 +1199,17 @@ def main() -> None:
 
     application.add_handler(conv_handler)
 
-    # Кнопка "Мои заявки" (не сотрудник)
+    # Кнопки главного меню (не сотрудники)
     application.add_handler(
         MessageHandler(
             filters.Regex("^📋 Мои заявки$") & ~filters.User(user_id=STAFF_IDS),
             show_my_requests,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.Regex("^💬 Обратная связь$") & ~filters.User(user_id=STAFF_IDS),
+            feedback_start,
         )
     )
 
@@ -1160,6 +1222,9 @@ def main() -> None:
     application.add_handler(CommandHandler("start", lambda u, c: show_pending_royalty(u, c), filters=filters.User(user_id=SUPPORT_IDS)))
     application.add_handler(CommandHandler("pendingroyalty", show_pending_royalty, filters=filters.User(user_id=SUPPORT_IDS)))
     application.add_handler(CallbackQueryHandler(view_royalty_card, pattern="^view_royalty_"))
+
+    # /start для директора — просто пояснение, без функционала заявок
+    application.add_handler(CommandHandler("start", director_start, filters=filters.User(user_id=DIRECTOR_IDS)))
 
     # Кнопки поддержки (проверка роялти)
     application.add_handler(CallbackQueryHandler(confirm_royalty, pattern="^confirm_royalty_"))
@@ -1181,6 +1246,16 @@ def main() -> None:
         MessageHandler(
             filters.User(user_id=ADMIN_IDS) & (filters.Document.ALL | filters.PHOTO),
             admin_file_router,
+        )
+    )
+
+    # Общий "хвост" — ловит текст от партнёров вне диалога (сейчас нужен для
+    # обратной связи). Регистрируется ПОСЛЕДНИМ среди клиентских хендлеров,
+    # чтобы не перехватывать кнопки меню и шаги анкеты.
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~filters.User(user_id=STAFF_IDS),
+            customer_text_router,
         )
     )
 
